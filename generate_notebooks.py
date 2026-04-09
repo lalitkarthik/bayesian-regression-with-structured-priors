@@ -15,6 +15,11 @@ def add_code(nb, code, num=None):
 nb_can = new_notebook()
 add_md(nb_can, "# Canada VAR Pipeline — Library Implementation\nIncludes PyMC for Bayesian methods and Scikit-learn + Statsmodels for Frequentist.")
 add_code(nb_can, """\
+
+
+import os
+os.environ["PYTENSOR_FLAGS"] = "device=cuda,floatX=float32"
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -27,6 +32,7 @@ from sklearn.multioutput import MultiOutputRegressor
 from scipy import stats
 import pymc as pm
 import arviz as az
+from tqdm.auto import tqdm
 
 warnings.filterwarnings('ignore')
 
@@ -100,7 +106,7 @@ class VARModel(ABC):
     @abstractmethod
     def get_intervals(self, alpha=0.05): pass
     def predict(self, X_test):
-        B = this.get_coefficients()
+        B = self.get_coefficients()
         return X_test @ B.T
     def get_posterior_samples(self): return None
 
@@ -122,7 +128,7 @@ class SklearnRidgeVAR(VARModel):
         
         n = X_train.shape[0]
         B_boot = np.zeros((self.n_boot, d, d * p_fit))
-        for b in range(self.n_boot):
+        for b in tqdm(range(self.n_boot), desc=f"Bootstrap {self._name}", leave=False):
             nblocks = int(np.ceil(n / self.block_size))
             starts = np.random.randint(0, max(1, n - self.block_size + 1), size=nblocks)
             idx = [i for s in starts for i in range(s, s + self.block_size)][:n]
@@ -238,7 +244,7 @@ class PyMCBayesianVAR(VARModel):
             logger.setLevel(logging.ERROR)
             
             trace = pm.sample(draws=self.draws, tune=self.tune, chains=self.chains, 
-                              target_accept=0.85, random_seed=SEED, progressbar=False, compute_convergence_checks=False)
+                              target_accept=0.85, random_seed=SEED, progressbar=True, compute_convergence_checks=False)
 
         self.B_samples_ = trace.posterior["B"].values.reshape(-1, d, q)
         self.B_hat_ = np.mean(self.B_samples_, axis=0)
@@ -253,11 +259,11 @@ class PyMCBayesianVAR(VARModel):
 MODEL_REGISTRY = {
     'OLS': lambda: SklearnOLSVAR(),
     'Ridge': lambda: SklearnRidgeVAR(),
-    'Lasso': lambda: SklearnLassoVAR(alpha=LASSO_LAMBDA),
-    'Normal_PyMC': lambda: PyMCBayesianVAR('Normal', prior_scale=NORMAL_PRIOR_SCALE),
-    'Lasso_PyMC': lambda: PyMCBayesianVAR('Lasso', prior_scale=LASSO_LAMBDA),
-    'Horseshoe_PyMC': lambda: PyMCBayesianVAR('Horseshoe'),
-    'SpikeSlab_PyMC': lambda: PyMCBayesianVAR('SpikeSlab'),
+    'FreqLasso': lambda: SklearnLassoVAR(alpha=LASSO_LAMBDA),
+    'Normal': lambda: PyMCBayesianVAR('Normal', prior_scale=NORMAL_PRIOR_SCALE),
+    'Lasso': lambda: PyMCBayesianVAR('Lasso', prior_scale=LASSO_LAMBDA),
+    'Horseshoe': lambda: PyMCBayesianVAR('Horseshoe'),
+    'Spike and Slab': lambda: PyMCBayesianVAR('SpikeSlab'),
 }
 """)
 
@@ -269,7 +275,7 @@ def run_rolling_forecast(B_hat, Ytrain_diff, Ytrain_levels, Ytest_levels, p):
     diff_history = Ytrain_diff[-p:].copy()
     current_level = Ytrain_levels[-1:].copy()
     
-    for i in range(Ttest):
+    for i in tqdm(range(Ttest), desc="Rolling Forecast", leave=False):
         lag_vec = diff_history[::-1].flatten().reshape(1, -1)
         pred_diff = lag_vec @ B_hat.T
         pred_level = current_level + pred_diff
@@ -359,8 +365,8 @@ all_predictions = {}
 actual_prev_levels = Ytest_levels[:-1, :]
 
 # Run tests
-print("Running single pass for lag=1...")
-for p_val in range(1, 2):
+print(f"Running pass for lags {LAG_MIN} to {LAG_MAX}...")
+for p_val in range(LAG_MIN, LAG_MAX + 1):
     X_train, Y_train = make_var_design_p(Ytrain_diff, p_val)
     if X_train is None: continue
     
@@ -383,10 +389,92 @@ for p_val in range(1, 2):
             m['Method'] = model_name
         all_results.extend(metrics)
         sys_metric = [m for m in metrics if m['variable']=='All'][0]
-        print(f"  {model_name:15s} | RMSE: {sys_metric['RMSE']:.4f} | SMAPE: {sys_metric['SMAPE']:.2f}% | [{time.time()-t0:.1f}s]")
+        print(f"  {model_name:15s} | RMSE: {sys_metric['RMSE']:.4f} | SMAPE: {sys_metric['SMAPE']:.2f}% | AIC: {sys_metric['AIC']:.1f} | BIC: {sys_metric['BIC']:.1f} | [{time.time()-t0:.1f}s]")
 
 df_results = pd.DataFrame(all_results)
+
+# --- Save full results ---
+csv_path = os.path.join(OUTPUT_DIR, 'all_metrics.csv')
+df_results.to_csv(csv_path, index=False)
+print("Results saved to", csv_path)
+
+# --- Best-lag summary by AIC and RMSE ---
+df_all = df_results[df_results['variable'] == 'All'].copy()
+pd.set_option('display.max_columns', 10)
+pd.set_option('display.width', 120)
+print()
+print("=== Best Lag per Method (by AIC) ===")
+best_aic = df_all.loc[df_all.groupby('Method')['AIC'].idxmin(), ['Method', 'p', 'AIC', 'BIC', 'RMSE']]
+print(best_aic.reset_index(drop=True))
+print()
+print("=== Best Lag per Method (by RMSE) ===")
+best_rmse = df_all.loc[df_all.groupby('Method')['RMSE'].idxmin(), ['Method', 'p', 'RMSE', 'SMAPE', 'AIC']]
+print(best_rmse.reset_index(drop=True))
+
 df_results.head(10)
+""")
+
+add_code(nb_can, """\
+# ============================================================
+# VISUALIZATION — Forecast RMSE heatmap across Lags x Methods
+# ============================================================
+import seaborn as sns
+
+df_all = df_results[df_results['variable'] == 'All'].copy()
+pivot_rmse = df_all.pivot_table(index='p', columns='Method', values='RMSE')
+
+fig, axes = plt.subplots(1, 2, figsize=(18, 6))
+
+sns.heatmap(pivot_rmse, annot=True, fmt='.3f', cmap='YlOrRd', ax=axes[0],
+            linewidths=0.5, cbar_kws={'label': 'RMSE'})
+axes[0].set_title('Forecast RMSE by Lag and Method', fontsize=14, fontweight='bold')
+axes[0].set_xlabel('Method')
+axes[0].set_ylabel('Lag (p)')
+
+pivot_aic = df_all.pivot_table(index='p', columns='Method', values='AIC')
+sns.heatmap(pivot_aic, annot=True, fmt='.0f', cmap='Blues_r', ax=axes[1],
+            linewidths=0.5, cbar_kws={'label': 'AIC'})
+axes[1].set_title('AIC by Lag and Method', fontsize=14, fontweight='bold')
+axes[1].set_xlabel('Method')
+axes[1].set_ylabel('Lag (p)')
+
+plt.suptitle('Canada VAR — Model Selection Overview', fontsize=16, fontweight='bold', y=1.02)
+plt.tight_layout()
+plt.savefig(os.path.join(OUTPUT_DIR, 'heatmap_rmse_aic.png'), dpi=150, bbox_inches='tight')
+plt.show()
+print("Heatmap saved.")
+""")
+
+add_code(nb_can, """\
+# ============================================================
+# VISUALIZATION — Forecast vs Actual for best lag per method
+# ============================================================
+best_p_per_method = df_all.loc[df_all.groupby('Method')['RMSE'].idxmin(), ['Method', 'p']]
+test_dates = list(range(len(actual_test_levels)))
+
+fig, axes = plt.subplots(d, 1, figsize=(14, 3 * d), sharex=True)
+if d == 1: axes = [axes]
+
+for col_idx, col in enumerate(COL_NAMES):
+    ax = axes[col_idx]
+    ax.plot(test_dates, actual_test_levels[:, col_idx], 'k-o', linewidth=2,
+            markersize=5, label='Actual', zorder=5)
+    for _, row in best_p_per_method.iterrows():
+        key = (int(row['p']), row['Method'])
+        if key in all_predictions:
+            preds = all_predictions[key]['preds']
+            ax.plot(test_dates, preds[:, col_idx], '--', linewidth=1.4,
+                    label=f"{row['Method']} (p={int(row['p'])})", alpha=0.8)
+    ax.set_title(f'Variable: {col}', fontsize=11)
+    ax.legend(fontsize=7, loc='upper right')
+    ax.grid(True, alpha=0.3)
+
+fig.suptitle('Forecast vs Actual — Best Lag per Method', fontsize=14, fontweight='bold')
+plt.xlabel('Test Step')
+plt.tight_layout()
+plt.savefig(os.path.join(OUTPUT_DIR, 'forecast_vs_actual.png'), dpi=150, bbox_inches='tight')
+plt.show()
+print("Forecast plot saved.")
 """)
 
 with open('c:\\Users\\adity\\OneDrive\\Desktop\\Stats for AIML\\bayesian-regression-with-structured-priors\\canada_var_pipeline_library.ipynb', 'w') as f:
@@ -398,6 +486,12 @@ with open('c:\\Users\\adity\\OneDrive\\Desktop\\Stats for AIML\\bayesian-regress
 nb_sim = new_notebook()
 add_md(nb_sim, "# VAR Simulation Pipeline — Library Implementation\nEvaluating Scikit-Learn/PyMC shrinkage priors across Scenarios")
 add_code(nb_sim, """\
+
+
+import os
+os.environ["PYTENSOR_FLAGS"] = "device=cpu,floatX=float64"
+# CPU required: PyMC NUTS sampler is incompatible with CUDA backend
+
 import numpy as np
 import pandas as pd
 import time
@@ -409,10 +503,11 @@ from sklearn.linear_model import Ridge, Lasso, LinearRegression
 from sklearn.multioutput import MultiOutputRegressor
 from scipy import stats
 import pymc as pm
+from tqdm.auto import tqdm
 
 warnings.filterwarnings('ignore')
 
-N_REPLICATIONS = 2
+N_REPLICATIONS = 5
 T_TOTAL = 200
 T_TEST = 20
 BURNIN = 50
@@ -560,7 +655,7 @@ class PyMCBayesianVAR(VARModel):
             logger = logging.getLogger("pymc")
             logger.setLevel(logging.ERROR)
             trace = pm.sample(draws=self.draws, tune=self.tune, chains=self.chains, 
-                              target_accept=0.85, random_seed=SEED, progressbar=False, compute_convergence_checks=False)
+                              target_accept=0.85, random_seed=SEED, progressbar=True, compute_convergence_checks=False)
 
         self.B_samples_ = trace.posterior["B"].values.reshape(-1, d, q)
         self.B_hat_ = np.mean(self.B_samples_, axis=0)
@@ -576,11 +671,22 @@ add_code(nb_sim, """\
 MODEL_REGISTRY = {
     'OLS': lambda: SklearnOLSVAR(),
     'Ridge': lambda: SklearnRidgeVAR(),
-    'Normal_PyMC': lambda: PyMCBayesianVAR('Normal'),
-    'Lasso_PyMC': lambda: PyMCBayesianVAR('Lasso'),
-    'Horseshoe_PyMC': lambda: PyMCBayesianVAR('Horseshoe'),
-    'SpikeSlab_PyMC': lambda: PyMCBayesianVAR('SpikeSlab'),
+    'Normal': lambda: PyMCBayesianVAR('Normal'),
+    'Lasso': lambda: PyMCBayesianVAR('Lasso'),
+    'Horseshoe': lambda: PyMCBayesianVAR('Horseshoe'),
+    'Spike and Slab': lambda: PyMCBayesianVAR('SpikeSlab'),
 }
+
+def compute_aic_bic(Y_train, pred_train, d, p):
+    T = Y_train.shape[0]
+    eps = Y_train - pred_train
+    Sigma = eps.T @ eps / T
+    Sigma += np.eye(d) * 1e-8
+    det_S = np.linalg.det(Sigma)
+    if det_S <= 0: det_S = 1e-8
+    log_det = np.log(det_S)
+    k = d * d * p
+    return float(T * log_det + 2 * k), float(T * log_det + np.log(T) * k)
 
 class MetricsEngine:
     @staticmethod
@@ -588,7 +694,7 @@ class MetricsEngine:
         Y_for_forecast = np.vstack([Ytrain[-p:, :], Ytest])
         Ttest = Ytest.shape[0]
         rmse_vec = []
-        for i in range(p, p + Ttest - 1):
+        for i in tqdm(range(p, p + Ttest - 1), desc="Simulated Forecast", leave=False):
             lags = []
             for lag_j in range(p): lags.extend(Y_for_forecast[i - lag_j, :])
             pred = np.array(lags).reshape(1, -1) @ B.T
@@ -668,34 +774,121 @@ def run_single_replication(scen_id, rep, rng):
             B_hat = B_ols
             B_lo, B_hi = model.get_intervals()
         else:
-            model = factory().fit(X_train, Y_train, d, p_fit)
-            B_hat = model.get_coefficients()
-            B_lo, B_hi = model.get_intervals()
+            try:
+                model = factory().fit(X_train, Y_train, d, p_fit)
+                B_hat = model.get_coefficients()
+                B_lo, B_hi = model.get_intervals()
+            except Exception as e:
+                print(f"    [{name}] FAILED: {e} — skipping")
+                continue
             
+        pred_train = X_train @ B_hat.T
+        aic, bic = compute_aic_bic(Y_train, pred_train, d, p_fit)
         f_rmse = MetricsEngine.forecast_rmse(B_hat, Ytrain, Ytest, p_fit)
         mets = MetricsEngine.param_metrics(B_hat, B_lo, B_hi, B_true)
         shrinkage = np.mean(np.abs(B_hat)) / max(1e-8, mean_abs_B_ols)
         
         row = {
-            'scenario': scen_id, 'rep': rep, 'model': name,
-            'forecast_rmse': f_rmse, 'shrinkage_ratio': shrinkage
+            'scenario': scen_id, 'scenario_name': SCENARIOS[scen_id]['name'],
+            'rep': rep, 'model': name,
+            'forecast_rmse': f_rmse, 'shrinkage_ratio': shrinkage,
+            'AIC': aic, 'BIC': bic
         }
         row.update(mets)
         results.append(row)
     return results
 
 all_results = []
-for s_id in [1]: # run full on small scale
+for s_id in SCENARIOS.keys():
     rng = np.random.RandomState(SCENARIOS[s_id]['seed'])
-    print(f"Running Scenario {s_id}")
-    for r in range(1, 2):
+    scen_name = SCENARIOS[s_id]['name']
+    print(f"Running Scenario {s_id}: {scen_name}")
+    for r in tqdm(range(1, N_REPLICATIONS + 1), desc="Replications"):
         t0 = time.time()
         res = run_single_replication(s_id, r, rng)
         all_results.extend(res)
-        print(f"  Rep {r} Done in {time.time()-t0:.1f}s")
+        elapsed = round(time.time() - t0, 1)
+        print(f"  Rep {r}/{N_REPLICATIONS} Done in {elapsed}s")
 
 df = pd.DataFrame(all_results)
+
+# --- Save results ---
+OUTPUT_DIR = os.path.join(os.getcwd(), 'simulation_results')
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+csv_path = os.path.join(OUTPUT_DIR, 'simulation_metrics.csv')
+df.to_csv(csv_path, index=False)
+print("Results saved to", csv_path)
+
 df.head(10)
+""")
+
+add_code(nb_sim, """\
+# ============================================================
+# VISUALIZATION — Metric comparison across Models x Scenarios
+# ============================================================
+import seaborn as sns
+
+if len(df) > 0:
+    df_avg = df.groupby(['scenario_name', 'model'])[['forecast_rmse', 'param_rmse', 'coverage',
+                                                       'sparsity_recovery_rate', 'false_discovery_rate']].mean().reset_index()
+
+    scenarios = df_avg['scenario_name'].unique()
+    n_scen = len(scenarios)
+    fig, axes = plt.subplots(n_scen, 2, figsize=(16, 5 * n_scen))
+    if n_scen == 1: axes = axes.reshape(1, -1)
+
+    for idx, scen in enumerate(scenarios):
+        scen_df = df_avg[df_avg['scenario_name'] == scen].sort_values('forecast_rmse')
+        colors = ['#2196F3' if 'PyMC' not in m else '#FF5722' for m in scen_df['model']]
+
+        ax0 = axes[idx, 0]
+        ax0.barh(scen_df['model'], scen_df['forecast_rmse'], color=colors)
+        ax0.set_title(f'{scen}\\nForecast RMSE (lower=better)', fontsize=11)
+        ax0.set_xlabel('Forecast RMSE')
+        ax0.grid(axis='x', alpha=0.3)
+
+        ax1 = axes[idx, 1]
+        ax1.barh(scen_df['model'], scen_df['param_rmse'], color=colors)
+        ax1.set_title(f'{scen}\\nParam RMSE vs B_true (lower=better)', fontsize=11)
+        ax1.set_xlabel('Param RMSE')
+        ax1.grid(axis='x', alpha=0.3)
+
+    from matplotlib.patches import Patch
+    handles = [Patch(color='#2196F3', label='Frequentist'), Patch(color='#FF5722', label='Bayesian')]
+    fig.legend(handles=handles, loc='upper right', fontsize=11)
+    plt.suptitle('VAR Simulation — Shrinkage Prior Comparison', fontsize=15, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUTPUT_DIR, 'simulation_comparison.png'), dpi=150, bbox_inches='tight')
+    plt.show()
+    print("Simulation comparison chart saved.")
+else:
+    print("No results to plot.")
+""")
+
+add_code(nb_sim, """\
+# ============================================================
+# VISUALIZATION — Sparsity Recovery and CI Coverage heatmap
+# ============================================================
+if len(df) > 0:
+    df_avg = df.groupby(['scenario_name', 'model'])[['coverage', 'sparsity_recovery_rate',
+                                                       'false_discovery_rate', 'shrinkage_ratio']].mean().reset_index()
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+
+    piv_cov = df_avg.pivot(index='model', columns='scenario_name', values='coverage')
+    sns.heatmap(piv_cov, annot=True, fmt='.2f', cmap='Greens', ax=axes[0],
+                linewidths=0.5, vmin=0, vmax=1)
+    axes[0].set_title('CI Coverage Rate (target=0.95)', fontsize=12, fontweight='bold')
+
+    piv_spar = df_avg.pivot(index='model', columns='scenario_name', values='sparsity_recovery_rate')
+    sns.heatmap(piv_spar, annot=True, fmt='.2f', cmap='Blues', ax=axes[1],
+                linewidths=0.5, vmin=0, vmax=1)
+    axes[1].set_title('Sparsity Recovery Rate (higher=better)', fontsize=12, fontweight='bold')
+
+    plt.suptitle('Uncertainty Quantification — Coverage & Sparsity', fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUTPUT_DIR, 'simulation_coverage_sparsity.png'), dpi=150, bbox_inches='tight')
+    plt.show()
+    print("Coverage/sparsity chart saved.")
 """)
 
 with open('c:\\Users\\adity\\OneDrive\\Desktop\\Stats for AIML\\bayesian-regression-with-structured-priors\\var_simulation_pipeline_library.ipynb', 'w') as f:

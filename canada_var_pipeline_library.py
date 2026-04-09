@@ -20,7 +20,7 @@ from scipy import stats
 import pymc as pm
 import arviz as az
 from statsmodels.datasets import get_rdataset
-
+from tqdm.auto import tqdm
 warnings.filterwarnings('ignore')
 
 LAMBDA_RIDGE = 0.1
@@ -121,7 +121,7 @@ class SklearnRidgeVAR(VARModel):
         
         n = X_train.shape[0]
         B_boot = np.zeros((self.n_boot, d, d * p_fit))
-        for b in range(self.n_boot):
+        for b in tqdm(range(self.n_boot), desc=f"Bootstrap {self._name}", leave=False):
             nblocks = int(np.ceil(n / self.block_size))
             starts = np.random.randint(0, max(1, n - self.block_size + 1), size=nblocks)
             idx = [i for s in starts for i in range(s, s + self.block_size)][:n]
@@ -240,7 +240,7 @@ class PyMCBayesianVAR(VARModel):
             logger.setLevel(logging.ERROR)
             
             trace = pm.sample(draws=self.draws, tune=self.tune, chains=self.chains, 
-                              target_accept=0.85, random_seed=SEED, progressbar=False, compute_convergence_checks=False)
+                              target_accept=0.85, random_seed=SEED, progressbar=True, compute_convergence_checks=False)
 
         self.B_samples_ = trace.posterior["B"].values.reshape(-1, d, q)
         self.B_hat_ = np.mean(self.B_samples_, axis=0)
@@ -274,7 +274,7 @@ def run_rolling_forecast(B_hat, Ytrain_diff, Ytrain_levels, Ytest_levels, p):
     diff_history = Ytrain_diff[-p:].copy()
     current_level = Ytrain_levels[-1:].copy()
     
-    for i in range(Ttest):
+    for i in tqdm(range(Ttest), desc="Rolling Forecast", leave=False):
         lag_vec = diff_history[::-1].flatten().reshape(1, -1)
         pred_diff = lag_vec @ B_hat.T
         pred_level = current_level + pred_diff
@@ -311,7 +311,21 @@ class MetricsEngine:
         return float(100.0 * np.mean(np.sign(actual_diff) == np.sign(pred_diff)))
 
     @staticmethod
-    def compute_all_metrics(actual, predicted, actual_prev, col_names):
+    def aic_bic(actual_train, pred_train, d, p):
+        T = actual_train.shape[0]
+        eps = actual_train - pred_train
+        Sigma = eps.T @ eps / T
+        Sigma += np.eye(d) * 1e-8
+        det_Sigma = np.linalg.det(Sigma)
+        if det_Sigma <= 0: det_Sigma = 1e-8
+        log_det = np.log(det_Sigma)
+        num_params = d * d * p
+        aic = T * log_det + 2 * num_params
+        bic = T * log_det + np.log(T) * num_params
+        return float(aic), float(bic)
+
+    @staticmethod
+    def compute_all_metrics(actual, predicted, actual_prev, col_names, aic=np.nan, bic=np.nan):
         results = []
         d = actual.shape[1]
         for j in range(d):
@@ -336,7 +350,9 @@ class MetricsEngine:
             'MAPE': MetricsEngine.mape(a_f, p_f),
             'MAE': MetricsEngine.mae(a_f, p_f),
             'SMAPE': MetricsEngine.smape(a_f, p_f),
-            'DirAcc': MetricsEngine.directional_accuracy(a_f, p_f, prev_f)
+            'DirAcc': MetricsEngine.directional_accuracy(a_f, p_f, prev_f),
+            'AIC': aic,
+            'BIC': bic
         })
         return results
 
@@ -351,8 +367,8 @@ all_predictions = {}
 actual_prev_levels = Ytest_levels[:-1, :]
 
 # Run tests
-print("Running single pass for lag=1...")
-for p_val in range(1, 2):
+print(f"Running pass for lags {LAG_MIN} to {LAG_MAX}...")
+for p_val in range(LAG_MIN, LAG_MAX + 1):
     X_train, Y_train = make_var_design_p(Ytrain_diff, p_val)
     if X_train is None: continue
     
@@ -362,15 +378,20 @@ for p_val in range(1, 2):
         t0 = time.time()
         model.fit(X_train, Y_train, d, p_val)
         B_hat = model.get_coefficients()
+        
+        # Calculate training predictions for AIC/BIC
+        pred_train = X_train @ B_hat.T
+        aic, bic = MetricsEngine.aic_bic(Y_train, pred_train, d, p_val)
+        
         preds = run_rolling_forecast(B_hat, Ytrain_diff, Ytrain_levels, Ytest_levels, p_val)
         all_predictions[(p_val, model_name)] = dict(preds=preds, B=B_hat)
-        metrics = MetricsEngine.compute_all_metrics(actual_test_levels, preds, actual_prev_levels, COL_NAMES)
+        metrics = MetricsEngine.compute_all_metrics(actual_test_levels, preds, actual_prev_levels, COL_NAMES, aic, bic)
         for m in metrics:
             m['p'] = p_val
             m['Method'] = model_name
         all_results.extend(metrics)
         sys_metric = [m for m in metrics if m['variable']=='All'][0]
-        print(f"  {model_name:15s} | RMSE: {sys_metric['RMSE']:.4f} | SMAPE: {sys_metric['SMAPE']:.2f}% | [{time.time()-t0:.1f}s]")
+        print(f"  {model_name:15s} | RMSE: {sys_metric['RMSE']:.4f} | SMAPE: {sys_metric['SMAPE']:.2f}% | AIC: {sys_metric['AIC']:.1f} | BIC: {sys_metric['BIC']:.1f} | [{time.time()-t0:.1f}s]")
 
 df_results = pd.DataFrame(all_results)
 df_results.head(10)
