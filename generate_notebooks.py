@@ -32,7 +32,7 @@ from sklearn.multioutput import MultiOutputRegressor
 from scipy import stats
 import pymc as pm
 import arviz as az
-from tqdm.auto import tqdm
+from tqdm import tqdm
 
 warnings.filterwarnings('ignore')
 
@@ -128,7 +128,7 @@ class SklearnRidgeVAR(VARModel):
         
         n = X_train.shape[0]
         B_boot = np.zeros((self.n_boot, d, d * p_fit))
-        for b in tqdm(range(self.n_boot), desc=f"Bootstrap {self._name}", leave=False):
+        for b in tqdm(range(self.n_boot), desc=f"Bootstrap {self._name}", leave=False, ascii=True, ncols=80):
             nblocks = int(np.ceil(n / self.block_size))
             starts = np.random.randint(0, max(1, n - self.block_size + 1), size=nblocks)
             idx = [i for s in starts for i in range(s, s + self.block_size)][:n]
@@ -275,7 +275,7 @@ def run_rolling_forecast(B_hat, Ytrain_diff, Ytrain_levels, Ytest_levels, p):
     diff_history = Ytrain_diff[-p:].copy()
     current_level = Ytrain_levels[-1:].copy()
     
-    for i in tqdm(range(Ttest), desc="Rolling Forecast", leave=False):
+    for i in tqdm(range(Ttest), desc="Rolling Forecast", leave=False, ascii=True, ncols=80):
         lag_vec = diff_history[::-1].flatten().reshape(1, -1)
         pred_diff = lag_vec @ B_hat.T
         pred_level = current_level + pred_diff
@@ -503,7 +503,7 @@ from sklearn.linear_model import Ridge, Lasso, LinearRegression
 from sklearn.multioutput import MultiOutputRegressor
 from scipy import stats
 import pymc as pm
-from tqdm.auto import tqdm
+from tqdm import tqdm
 
 warnings.filterwarnings('ignore')
 
@@ -694,7 +694,7 @@ class MetricsEngine:
         Y_for_forecast = np.vstack([Ytrain[-p:, :], Ytest])
         Ttest = Ytest.shape[0]
         rmse_vec = []
-        for i in tqdm(range(p, p + Ttest - 1), desc="Simulated Forecast", leave=False):
+        for i in tqdm(range(p, p + Ttest - 1), desc="Simulated Forecast", leave=False, ascii=True, ncols=80):
             lags = []
             for lag_j in range(p): lags.extend(Y_for_forecast[i - lag_j, :])
             pred = np.array(lags).reshape(1, -1) @ B.T
@@ -803,7 +803,7 @@ for s_id in SCENARIOS.keys():
     rng = np.random.RandomState(SCENARIOS[s_id]['seed'])
     scen_name = SCENARIOS[s_id]['name']
     print(f"Running Scenario {s_id}: {scen_name}")
-    for r in tqdm(range(1, N_REPLICATIONS + 1), desc="Replications"):
+    for r in tqdm(range(1, N_REPLICATIONS + 1), desc="Replications", ascii=True, ncols=80):
         t0 = time.time()
         res = run_single_replication(s_id, r, rng)
         all_results.extend(res)
